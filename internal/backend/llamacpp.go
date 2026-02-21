@@ -1,7 +1,9 @@
 package backend
 
 import (
+	"archive/tar"
 	"archive/zip"
+	"compress/gzip"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -127,7 +129,7 @@ func (m *Manager) BackendURL() string {
 // ------- internal helpers -------
 
 func (m *Manager) findRelease() (downloadURL, assetName string, err error) {
-	resp, err := http.Get("https://api.github.com/repos/ggerganov/llama.cpp/releases/latest")
+	resp, err := http.Get("https://api.github.com/repos/ggml-org/llama.cpp/releases/latest")
 	if err != nil {
 		return "", "", err
 	}
@@ -147,24 +149,31 @@ func (m *Manager) findRelease() (downloadURL, assetName string, err error) {
 		return "", "", err
 	}
 
-	target := targetAssetHint()
+	targets := targetAssetHints()
 
-	// Exact match first
-	for _, a := range release.Assets {
-		lower := strings.ToLower(a.Name)
-		if strings.Contains(lower, target) && strings.HasSuffix(lower, ".zip") {
-			return a.URL, a.Name, nil
+	// Try each hint in priority order
+	for _, target := range targets {
+		for _, a := range release.Assets {
+			lower := strings.ToLower(a.Name)
+			if strings.Contains(lower, target) && isArchive(lower) {
+				return a.URL, a.Name, nil
+			}
 		}
 	}
 
-	// Broad fallback — match OS, exclude CUDA/Vulkan (CPU only)
+	// Broad fallback — match OS keyword, exclude accelerators (CPU only)
+	osKey := osAssetKey()
 	for _, a := range release.Assets {
 		lower := strings.ToLower(a.Name)
-		if strings.Contains(lower, runtime.GOOS) &&
-			strings.HasSuffix(lower, ".zip") &&
+		if strings.Contains(lower, osKey) &&
+			isArchive(lower) &&
 			!strings.Contains(lower, "cuda") &&
 			!strings.Contains(lower, "vulkan") &&
-			!strings.Contains(lower, "sycl") {
+			!strings.Contains(lower, "sycl") &&
+			!strings.Contains(lower, "hip") &&
+			!strings.Contains(lower, "opencl") &&
+			!strings.Contains(lower, "aclgraph") &&
+			!strings.Contains(lower, "cudart") {
 			return a.URL, a.Name, nil
 		}
 	}
@@ -172,22 +181,51 @@ func (m *Manager) findRelease() (downloadURL, assetName string, err error) {
 	return "", "", fmt.Errorf("no llama.cpp release found for %s/%s", runtime.GOOS, runtime.GOARCH)
 }
 
-func targetAssetHint() string {
+// targetAssetHints returns prioritized asset name substrings to match.
+func targetAssetHints() []string {
 	switch {
 	case runtime.GOOS == "windows" && runtime.GOARCH == "amd64":
-		return "win-avx2-x64"
+		return []string{"win-cpu-x64", "win-avx2-x64"}
+	case runtime.GOOS == "windows" && runtime.GOARCH == "arm64":
+		return []string{"win-cpu-arm64", "win-arm64"}
 	case runtime.GOOS == "darwin" && runtime.GOARCH == "arm64":
-		return "macos-arm64"
+		return []string{"macos-arm64"}
 	case runtime.GOOS == "darwin" && runtime.GOARCH == "amd64":
-		return "macos-x64"
+		return []string{"macos-x64"}
 	case runtime.GOOS == "linux" && runtime.GOARCH == "amd64":
-		return "linux-x64"
+		return []string{"ubuntu-x64"}
 	default:
-		return runtime.GOOS + "-" + runtime.GOARCH
+		return []string{runtime.GOOS + "-" + runtime.GOARCH}
 	}
 }
 
-func (m *Manager) extractBinaries(zipPath, serverDest string) error {
+// osAssetKey returns the OS keyword used in llama.cpp asset names.
+func osAssetKey() string {
+	switch runtime.GOOS {
+	case "windows":
+		return "win-"
+	case "darwin":
+		return "macos-"
+	case "linux":
+		return "ubuntu-"
+	default:
+		return runtime.GOOS
+	}
+}
+
+// isArchive checks if the filename is a supported archive format.
+func isArchive(name string) bool {
+	return strings.HasSuffix(name, ".zip") || strings.HasSuffix(name, ".tar.gz")
+}
+
+func (m *Manager) extractBinaries(archivePath, serverDest string) error {
+	if strings.HasSuffix(strings.ToLower(archivePath), ".tar.gz") {
+		return m.extractFromTarGz(archivePath, serverDest)
+	}
+	return m.extractFromZip(archivePath, serverDest)
+}
+
+func (m *Manager) extractFromZip(zipPath, serverDest string) error {
 	r, err := zip.OpenReader(zipPath)
 	if err != nil {
 		return fmt.Errorf("opening zip: %w", err)
@@ -219,7 +257,54 @@ func (m *Manager) extractBinaries(zipPath, serverDest string) error {
 	}
 
 	if !found {
-		return fmt.Errorf("llama-server not found in zip")
+		return fmt.Errorf("llama-server not found in archive")
+	}
+	return nil
+}
+
+func (m *Manager) extractFromTarGz(tarGzPath, serverDest string) error {
+	f, err := os.Open(tarGzPath)
+	if err != nil {
+		return fmt.Errorf("opening tar.gz: %w", err)
+	}
+	defer f.Close()
+
+	gr, err := gzip.NewReader(f)
+	if err != nil {
+		return fmt.Errorf("creating gzip reader: %w", err)
+	}
+	defer gr.Close()
+
+	tr := tar.NewReader(gr)
+	serverName := "llama-server"
+
+	found := false
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("reading tar: %w", err)
+		}
+
+		base := filepath.Base(hdr.Name)
+		if base == serverName {
+			out, err := os.Create(serverDest)
+			if err != nil {
+				return err
+			}
+			_, err = io.Copy(out, tr)
+			out.Close()
+			if err != nil {
+				return err
+			}
+			found = true
+		}
+	}
+
+	if !found {
+		return fmt.Errorf("llama-server not found in archive")
 	}
 	return nil
 }
